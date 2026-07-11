@@ -10,12 +10,19 @@ import {
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
 import { expect } from "chai";
+import os from "os";
+import path from "path";
 import { RealEstate } from "../target/types/real_estate";
 
 const METADATA_PROGRAM_ID = new PublicKey("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
 
 describe("real-estate program", () => {
-  const provider = anchor.getProvider() as anchor.AnchorProvider;
+  if (!process.env.ANCHOR_WALLET) {
+    process.env.ANCHOR_WALLET = path.join(os.homedir(), ".config", "solana", "id.json");
+  }
+
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
   provider.connection = new Connection(provider.connection.rpcEndpoint, "confirmed");
   provider.opts.commitment = "confirmed";
   const connection = provider.connection;
@@ -51,6 +58,49 @@ describe("real-estate program", () => {
       program.programId,
     )[0];
 
+  const getInvestorPropertyAta = (mint: PublicKey, owner: PublicKey) =>
+    anchor.utils.token.associatedAddress({ mint, owner });
+
+  const investInListing = async (
+    fixture: Awaited<ReturnType<typeof setupFixture>>,
+    tokenAmount: BN,
+  ) => {
+    const investorPropertyAta = await getInvestorPropertyAta(fixture.propertyMint, fixture.investor.publicKey);
+
+    await program.methods
+      .invest(tokenAmount)
+      .accounts({
+        investor: fixture.investor.publicKey,
+        listing: fixture.listing,
+        investorUsdcAccount: fixture.investorUsdcAta,
+        escrowVault: fixture.escrowVault,
+        investorPropertyTokenAccount: investorPropertyAta,
+        propertyMint: fixture.propertyMint,
+        investorPosition: findPositionPda(fixture.investor.publicKey, fixture.listing),
+        usdcMint: fixture.usdcMint,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([fixture.investor])
+      .rpc();
+
+    return investorPropertyAta;
+  };
+
+  const releaseEscrowForListing = async (fixture: Awaited<ReturnType<typeof setupFixture>>) => {
+    await program.methods
+      .releaseEscrow()
+      .accounts({
+        authority: fixture.authority,
+        listing: fixture.listing,
+        escrowVault: fixture.escrowVault,
+        authorityUsdcAccount: fixture.authorityUsdcAta,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .rpc();
+  };
+
   const airdrop = async (wallet: PublicKey) => {
     await connection.requestAirdrop(wallet, 2_000_000_000);
   };
@@ -66,10 +116,8 @@ describe("real-estate program", () => {
   };
 
   const getDeadline = async (offsetSeconds = 60) => {
-    const currentSlot = await connection.getSlot();
-    const block = await connection.getBlock(currentSlot, undefined, "confirmed");
-    const timestamp = block?.blockTime ?? Math.floor(Date.now() / 1000);
-    return new BN(timestamp + offsetSeconds);
+    const farFutureBase = 4_102_444_800; // 2100-01-01T00:00:00Z
+    return new BN(farFutureBase + offsetSeconds);
   };
 
   const setupFixture = async () => {
@@ -247,29 +295,7 @@ describe("real-estate program", () => {
 
   it("allows an investor to buy tokens and transitions to funded when raise target is met", async () => {
     const fixture = await setupFixture();
-
-    const investorPropertyAta = await anchor.utils.token.associatedAddress({
-      mint: fixture.propertyMint,
-      owner: fixture.investor.publicKey,
-    });
-
-    await program.methods
-      .invest(new BN(1_000))
-      .accounts({
-        investor: fixture.investor.publicKey,
-        listing: fixture.listing,
-        investorUsdcAccount: fixture.investorUsdcAta,
-        escrowVault: fixture.escrowVault,
-        investorPropertyTokenAccount: investorPropertyAta,
-        propertyMint: fixture.propertyMint,
-        investorPosition: findPositionPda(fixture.investor.publicKey, fixture.listing),
-        usdcMint: fixture.usdcMint,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-      })
-      .signers([fixture.investor])
-      .rpc();
+    await investInListing(fixture, new BN(1_000));
 
     const listingAccount = await program.account.propertyListing.fetch(fixture.listing);
     const positionAccount = await program.account.investorPosition.fetch(findPositionPda(fixture.investor.publicKey, fixture.listing));
@@ -283,39 +309,8 @@ describe("real-estate program", () => {
 
   it("releases escrow and marks the listing active once it is funded", async () => {
     const fixture = await setupFixture();
-    const investorPropertyAta = await anchor.utils.token.associatedAddress({
-      mint: fixture.propertyMint,
-      owner: fixture.investor.publicKey,
-    });
-
-    await program.methods
-      .invest(new BN(1_000))
-      .accounts({
-        investor: fixture.investor.publicKey,
-        listing: fixture.listing,
-        investorUsdcAccount: fixture.investorUsdcAta,
-        escrowVault: fixture.escrowVault,
-        investorPropertyTokenAccount: investorPropertyAta,
-        propertyMint: fixture.propertyMint,
-        investorPosition: findPositionPda(fixture.investor.publicKey, fixture.listing),
-        usdcMint: fixture.usdcMint,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-      })
-      .signers([fixture.investor])
-      .rpc();
-
-    await program.methods
-      .releaseEscrow()
-      .accounts({
-        authority: fixture.authority,
-        listing: fixture.listing,
-        escrowVault: fixture.escrowVault,
-        authorityUsdcAccount: fixture.authorityUsdcAta,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .rpc();
+    await investInListing(fixture, new BN(1_000));
+    await releaseEscrowForListing(fixture);
 
     const listingAccount = await program.account.propertyListing.fetch(fixture.listing);
     expect(listingAccount.status).to.deep.equal({ active: {} });
@@ -323,28 +318,7 @@ describe("real-estate program", () => {
 
   it("allows a refund claim for a cancelled or expired fundraising listing", async () => {
     const fixture = await setupFixture();
-    const investorPropertyAta = await anchor.utils.token.associatedAddress({
-      mint: fixture.propertyMint,
-      owner: fixture.investor.publicKey,
-    });
-
-    await program.methods
-      .invest(new BN(50))
-      .accounts({
-        investor: fixture.investor.publicKey,
-        listing: fixture.listing,
-        investorUsdcAccount: fixture.investorUsdcAta,
-        escrowVault: fixture.escrowVault,
-        investorPropertyTokenAccount: investorPropertyAta,
-        propertyMint: fixture.propertyMint,
-        investorPosition: findPositionPda(fixture.investor.publicKey, fixture.listing),
-        usdcMint: fixture.usdcMint,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-      })
-      .signers([fixture.investor])
-      .rpc();
+    const investorPropertyAta = await investInListing(fixture, new BN(50));
 
     await program.methods
       .cancelListing()
@@ -376,39 +350,8 @@ describe("real-estate program", () => {
 
   it("funds the rental vault and enables rental income claims", async () => {
     const fixture = await setupFixture();
-    const investorPropertyAta = await anchor.utils.token.associatedAddress({
-      mint: fixture.propertyMint,
-      owner: fixture.investor.publicKey,
-    });
-
-    await program.methods
-      .invest(new BN(1_000))
-      .accounts({
-        investor: fixture.investor.publicKey,
-        listing: fixture.listing,
-        investorUsdcAccount: fixture.investorUsdcAta,
-        escrowVault: fixture.escrowVault,
-        investorPropertyTokenAccount: investorPropertyAta,
-        propertyMint: fixture.propertyMint,
-        investorPosition: findPositionPda(fixture.investor.publicKey, fixture.listing),
-        usdcMint: fixture.usdcMint,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-      })
-      .signers([fixture.investor])
-      .rpc();
-
-    await program.methods
-      .releaseEscrow()
-      .accounts({
-        authority: fixture.authority,
-        listing: fixture.listing,
-        escrowVault: fixture.escrowVault,
-        authorityUsdcAccount: fixture.authorityUsdcAta,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .rpc();
+    await investInListing(fixture, new BN(1_000));
+    await releaseEscrowForListing(fixture);
 
     await program.methods
       .fundRentalVault(new BN(5_000))
@@ -440,39 +383,8 @@ describe("real-estate program", () => {
 
   it("requests and approves redemption for an investor with sufficient tokens", async () => {
     const fixture = await setupFixture();
-    const investorPropertyAta = await anchor.utils.token.associatedAddress({
-      mint: fixture.propertyMint,
-      owner: fixture.investor.publicKey,
-    });
-
-    await program.methods
-      .invest(new BN(1_000))
-      .accounts({
-        investor: fixture.investor.publicKey,
-        listing: fixture.listing,
-        investorUsdcAccount: fixture.investorUsdcAta,
-        escrowVault: fixture.escrowVault,
-        investorPropertyTokenAccount: investorPropertyAta,
-        propertyMint: fixture.propertyMint,
-        investorPosition: findPositionPda(fixture.investor.publicKey, fixture.listing),
-        usdcMint: fixture.usdcMint,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-      })
-      .signers([fixture.investor])
-      .rpc();
-
-    await program.methods
-      .releaseEscrow()
-      .accounts({
-        authority: fixture.authority,
-        listing: fixture.listing,
-        escrowVault: fixture.escrowVault,
-        authorityUsdcAccount: fixture.authorityUsdcAta,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .rpc();
+    const investorPropertyAta = await investInListing(fixture, new BN(1_000));
+    await releaseEscrowForListing(fixture);
 
     await program.methods
       .requestRedemption()
